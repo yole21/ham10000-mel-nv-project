@@ -1,6 +1,8 @@
 from pathlib import Path
 import argparse
 import json
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve
 
 import numpy as np
 import pandas as pd
@@ -18,21 +20,8 @@ from dataset import create_dataloaders
 from model import create_resnet18_model
 
 
-# ============================================================
 # evaluate_experiment.py
 # Evaluate saved checkpoints from train_experiment.py
-#
-# Supports checkpoints saved as:
-#   {
-#       "epoch": ...,
-#       "model_state_dict": ...,
-#       "optimizer_state_dict": ...,
-#       "config": {...},
-#       ...
-#   }
-#
-# Also supports plain state_dict for backward compatibility.
-# ============================================================
 
 
 def parse_args():
@@ -51,7 +40,6 @@ def parse_args():
     return parser.parse_args()
 
 
-
 def infer_freeze_mode_from_filename(model_path: Path) -> bool:
     name = model_path.stem.lower()
     if "freeze" in name:
@@ -64,24 +52,22 @@ def infer_freeze_mode_from_filename(model_path: Path) -> bool:
     )
 
 
-
 def make_output_dirs(base_output_dir: str):
     base = Path(base_output_dir)
     paths = {
         "base": base,
         "metrics": base / "metrics",
         "predictions": base / "predictions",
+        "figures": base / "figures",
     }
     for p in paths.values():
         p.mkdir(parents=True, exist_ok=True)
     return paths
 
 
-
 def save_json(data, path: Path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
 
 
 def load_model_for_evaluation(model_path: Path, device: torch.device):
@@ -142,7 +128,6 @@ def evaluate_model(model, loader, device):
     return all_labels, all_preds, all_probs, all_image_paths
 
 
-
 def compute_metrics(y_true, y_pred, y_prob):
     acc = accuracy_score(y_true, y_pred)
     precision = precision_score(y_true, y_pred, zero_division=0)
@@ -175,7 +160,6 @@ def compute_metrics(y_true, y_pred, y_prob):
     return metrics
 
 
-
 def save_predictions_csv(output_path: Path, y_true, y_pred, y_prob, image_paths):
     rows = []
     for path, true_label, pred_label, prob_mel in zip(image_paths, y_true, y_pred, y_prob):
@@ -193,6 +177,77 @@ def save_predictions_csv(output_path: Path, y_true, y_pred, y_prob, image_paths)
     pred_df.to_csv(output_path, index=False)
     return pred_df
 
+def prettify_experiment_name(exp_name: str) -> str:
+    pretty = exp_name
+
+    pretty = pretty.replace("freeze_ce", "Freeze + CE")
+    pretty = pretty.replace("freeze_weighted", "Freeze + Weighted")
+    pretty = pretty.replace("finetune_ce", "Fine-tune + CE")
+    pretty = pretty.replace("finetune_weighted", "Fine-tune + Weighted")
+
+    pretty = pretty.replace("_seed42", "")
+    pretty = pretty.replace("_seed52", "")
+    pretty = pretty.replace("_seed62", "")
+
+    return pretty
+
+def save_confusion_matrix_figure(cm, output_path: Path, title: str):
+    plt.figure(figsize=(5.2, 4.6))
+    ax = plt.gca()
+
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    ax.set_title(title, fontsize=15, pad=10)
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+
+    class_names = ["NV", "MEL"]
+    tick_marks = [0, 1]
+    ax.set_xticks(tick_marks)
+    ax.set_yticks(tick_marks)
+    ax.set_xticklabels(class_names, fontsize=11)
+    ax.set_yticklabels(class_names, fontsize=11)
+
+    threshold = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j,
+                i,
+                f"{cm[i, j]}",
+                ha="center",
+                va="center",
+                fontsize=13,
+                color="white" if cm[i, j] > threshold else "black"
+            )
+
+    # Add thin borders between cells
+    ax.set_xticks(np.arange(-0.5, cm.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, cm.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1.5)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    ax.set_ylabel("True Label", fontsize=12)
+    ax.set_xlabel("Predicted Label", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def save_roc_curve_figure(y_true, y_prob, auc_value: float, output_path: Path, title: str):
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+
+    plt.figure(figsize=(5.2, 4.6))
+    plt.plot(fpr, tpr, linewidth=2, label=f"AUC = {auc_value:.3f}")
+    plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1.5)
+
+    plt.xlabel("False Positive Rate", fontsize=12)
+    plt.ylabel("True Positive Rate", fontsize=12)
+    plt.title(title, fontsize=15, pad=10)
+    plt.xticks(fontsize=11)
+    plt.yticks(fontsize=11)
+    plt.legend(loc="lower right", fontsize=11, frameon=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 
 def main():
@@ -226,6 +281,7 @@ def main():
     metrics = compute_metrics(y_true, y_pred, y_prob)
 
     exp_name = model_path.stem
+
     predictions_path = output_dirs["predictions"] / f"{exp_name}_test_predictions.csv"
     save_predictions_csv(predictions_path, y_true, y_pred, y_prob, image_paths)
 
@@ -247,6 +303,29 @@ def main():
     metrics_json_path = output_dirs["metrics"] / f"{exp_name}_test.json"
     save_json(metrics_output, metrics_json_path)
 
+    # Save figures
+    figures_dir = output_dirs["figures"]
+    cm_array = np.array(metrics["confusion_matrix"])
+
+    cm_fig_path = figures_dir / f"cm_{exp_name}.png"
+    roc_fig_path = figures_dir / f"roc_{exp_name}.png"
+
+    pretty_name = prettify_experiment_name(exp_name)
+
+    save_confusion_matrix_figure(
+        cm_array,
+        cm_fig_path,
+        title=f"Confusion Matrix: {pretty_name}"
+    )
+
+    save_roc_curve_figure(
+        y_true,
+        y_prob,
+        metrics["auc"],
+        roc_fig_path,
+        title=f"ROC Curve: {pretty_name}"
+    )
+
     print("\n=== Test Results ===")
     print(f"Accuracy         : {metrics['accuracy']:.4f}")
     print(f"Precision        : {metrics['precision']:.4f}")
@@ -266,6 +345,8 @@ def main():
 
     print(f"\nSaved metrics     : {metrics_json_path}")
     print(f"Saved predictions : {predictions_path}")
+    print(f"Saved CM figure   : {cm_fig_path}")
+    print(f"Saved ROC figure  : {roc_fig_path}")
 
 
 if __name__ == "__main__":
